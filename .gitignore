@@ -1,0 +1,15 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# build artifacts
+*.bin
+*.elf
+*.o
+
+# editor / OS
+.vscode/
+.DS_Store
+.omc/
+*.log
