@@ -21,6 +21,8 @@
 #include <BLEScan.h>
 #include <BLEClient.h>
 #include <math.h>
+#include <stdarg.h>
+#include <Preferences.h>
 #include "logo_openclaw.h"   // OpenClaw boot logo (140x140 RGB565)
 
 // ---------- user config ------------------------------------------------------
@@ -30,9 +32,11 @@
 #define SHOW_FPS       true
 #define DEMO_AFTER_MS  60000   // demo face after 1 min with no BLE
 #define ZB_TEST        0       // set 1 only to auto-enter 0-100 mode for bench testing
+#define OBD_DEBUG      1       // verbose BLE/OBD diagnostics over serial (set 0 for release)
 
 // 0-100 km/h (제로백) launch-timer mode: double-tap on the SPEED gauge to enter.
 #define GAUGE_SPEED    1
+#define SETTINGS_PAGE  5       // 6th swipe page (after the 5 gauges) = settings menu
 #define ZB_TARGET      100.0f   // finish speed (km/h)
 #define ZB_ARM         2.0f     // speed below this = "at zero" (armable)
 #define ZB_LAUNCH      2.0f     // crossing this from armed starts the clock
@@ -150,6 +154,29 @@ volatile bool gotResponse=false;   // set when a full ELM327 response ('>') arri
 volatile uint32_t lastRespMs=0;    // millis of last OBD response (disconnect watchdog)
 volatile uint32_t respCount=0;     // total OBD responses (debug)
 
+// ---------- NVS-backed diagnostic log ----------------------------------------
+// Captures the first ~60s of connection diagnostics to a RAM buffer, then persists to
+// NVS. On the next boot the stored log is dumped to serial -> read it at your desk
+// without a laptop in the car. Capture is gated by the user-toggled `logEnabled` flag.
+Preferences   prefs;
+static char   logBuf[3000];
+static size_t logLen = 0;
+bool          logEnabled = false;   // persisted in NVS (settings menu toggles it)
+bool          logCapturing = false;
+bool          logFlushed = false;
+uint32_t      logStartMs = 0;
+#define LOG_WINDOW_MS 60000
+
+static void logAppend(const char* s){
+  if (!logCapturing) return;
+  while (*s && logLen < sizeof(logBuf)-1) logBuf[logLen++] = *s++;
+}
+// print to serial AND (when capturing) append to the NVS buffer
+void dlog(const char* fmt, ...){
+  char b[200]; va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof(b), fmt, ap); va_end(ap);
+  Serial.print(b); logAppend(b);
+}
+
 // =============================================================================
 //  OBD parsing (all 5 PIDs)
 // =============================================================================
@@ -157,12 +184,15 @@ static int hexToDec(String h){ return (int)strtol(h.c_str(),NULL,16); }
 
 void parseOBDResponse(String r){
   if (r.length()<4) return;
+  // Find the "41XX" mode-01 response anywhere in the string (not just at the start) so a
+  // real ELM327's "SEARCHING..." prefix, header bytes, or stray text don't break parsing.
   if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
-    if      (r.startsWith("410C") && r.length()>=8){ raw_rpm=(hexToDec(r.substring(4,6))*256+hexToDec(r.substring(6,8)))/4; nd_rpm=true; }
-    else if (r.startsWith("410D") && r.length()>=6){ raw_speed=hexToDec(r.substring(4,6)); nd_speed=true; }
-    else if (r.startsWith("4105") && r.length()>=6){ raw_coolant=hexToDec(r.substring(4,6))-40; nd_coolant=true; }
-    else if (r.startsWith("410B") && r.length()>=6){ raw_map=hexToDec(r.substring(4,6)); raw_boost=(raw_map-101)/100.0f; nd_boost=true; }
-    else if (r.startsWith("410E") && r.length()>=6){ raw_timing=hexToDec(r.substring(4,6))/2.0f-64.0f; nd_timing=true; }
+    int i;
+    if      ((i=r.indexOf("410C"))>=0 && r.length()>=i+8){ raw_rpm=(hexToDec(r.substring(i+4,i+6))*256+hexToDec(r.substring(i+6,i+8)))/4; nd_rpm=true; }
+    else if ((i=r.indexOf("410D"))>=0 && r.length()>=i+6){ raw_speed=hexToDec(r.substring(i+4,i+6)); nd_speed=true; }
+    else if ((i=r.indexOf("4105"))>=0 && r.length()>=i+6){ raw_coolant=hexToDec(r.substring(i+4,i+6))-40; nd_coolant=true; }
+    else if ((i=r.indexOf("410B"))>=0 && r.length()>=i+6){ raw_map=hexToDec(r.substring(i+4,i+6)); raw_boost=(raw_map-101)/100.0f; nd_boost=true; }
+    else if ((i=r.indexOf("410E"))>=0 && r.length()>=i+6){ raw_timing=hexToDec(r.substring(i+4,i+6))/2.0f-64.0f; nd_timing=true; }
     xSemaphoreGive(xMutex);
   }
 }
@@ -171,6 +201,7 @@ void parseOBDResponse(String r){
 //  BLE client (reused from obd_drive.ino)
 // =============================================================================
 static void notifyCallback(BLERemoteCharacteristic*, uint8_t* d, size_t len, bool){
+  { String s; for (size_t i=0;i<len;i++){ char c=(char)d[i]; s += (c>=32&&c<127)?c:'.'; } dlog("[rx %u] %s\n", (unsigned)len, s.c_str()); }
   for (size_t i=0;i<len;i++){ char c=(char)d[i];
     if (c=='>'){ parseOBDResponse(obdResponse); obdResponse=""; gotResponse=true; lastRespMs=millis(); respCount++; }
     else if (c!='\r' && c!=' ') obdResponse+=c; }
@@ -178,7 +209,13 @@ static void notifyCallback(BLERemoteCharacteristic*, uint8_t* d, size_t len, boo
 class ScanCallbacks : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice device) override {
     deviceCount = deviceCount + 1;
-    if (device.getName()==OBD_BLE_NAME){ targetDevice=new BLEAdvertisedDevice(device); device.getScan()->stop(); }
+    if (device.getName()==OBD_BLE_NAME){
+      dlog("[scan] MATCH %s name='%s'\n", device.getAddress().toString().c_str(), device.getName().c_str());
+      targetDevice=new BLEAdvertisedDevice(device); device.getScan()->stop();
+    }
+#if OBD_DEBUG
+    else Serial.printf("[scan] %s name='%s'\n", device.getAddress().toString().c_str(), device.getName().c_str());
+#endif
   }
 };
 class ClientCallbacks : public BLEClientCallbacks {
@@ -191,7 +228,7 @@ bool connectToOBD(){
   BLEScan* scan=BLEDevice::getScan();
   scan->setAdvertisedDeviceCallbacks(new ScanCallbacks());
   scan->setActiveScan(true); scan->setInterval(100); scan->setWindow(99);
-  scan->start(6, false);   // blocks until target found (onResult stops it) or 6s timeout.
+  scan->start(10, false);  // blocks until target found (onResult stops it) or 10s timeout.
   scan->stop();            // (no leftover delay -- the old delay(11000) wasted ~11s/connect)
   if (!targetDevice) return false;
   if (!pClient){                                  // create once, reuse on reconnect (no leak)
@@ -199,14 +236,26 @@ bool connectToOBD(){
     static ClientCallbacks ccb;
     pClient->setClientCallbacks(&ccb);
   }
-  if (!pClient->connect(targetDevice)) return false;
+  if (!pClient->connect(targetDevice)){ dlog("[ble] connect() failed\n"); return false; }
+  dlog("[ble] connected, discovering GATT...\n");
+  if (auto* svcs = pClient->getServices()){            // dump everything the adapter exposes
+    for (auto& s : *svcs){ BLERemoteService* sv=s.second;
+      dlog("[gatt] svc %s\n", sv->getUUID().toString().c_str());
+      if (auto* chs = sv->getCharacteristics()) for (auto& c : *chs){ BLERemoteCharacteristic* ch=c.second;
+        dlog("[gatt]   chr %s R%d W%d Wnr%d N%d I%d\n", ch->getUUID().toString().c_str(),
+             ch->canRead(), ch->canWrite(), ch->canWriteNoResponse(), ch->canNotify(), ch->canIndicate()); }
+    }
+  }
   BLERemoteService* svc=pClient->getService(SERVICE_UUID);
-  if (!svc) return false;
+  if (!svc){ dlog("[ble] service 18F0 NOT FOUND\n"); return false; }
   pTxChar=svc->getCharacteristic(CHAR_TX_UUID);
   pRxChar=svc->getCharacteristic(CHAR_RX_UUID);
-  if (!pTxChar || !pRxChar) return false;
-  if (pRxChar->canNotify()) pRxChar->registerForNotify(notifyCallback);
-  lastRespMs=millis();                                                // prime the watchdog
+  if (!pTxChar || !pRxChar){ dlog("[ble] TX/RX char NOT FOUND\n"); return false; }
+  // subscribe: notifications if supported, else indications (real adapters vary)
+  if      (pRxChar->canNotify())   { pRxChar->registerForNotify(notifyCallback, true);  dlog("[ble] subscribed (notify)\n"); }
+  else if (pRxChar->canIndicate()) { pRxChar->registerForNotify(notifyCallback, false); dlog("[ble] subscribed (indicate)\n"); }
+  else                             { dlog("[ble] RX char has NO notify/indicate!\n"); }
+  respCount=0; lastRespMs=millis();                                   // fresh per connection
   return true;
 }
 void initOBD(){ sendOBD("ATZ");delay(1000); sendOBD("ATE0");delay(200); sendOBD("ATL0");delay(200); sendOBD("ATS0");delay(200); sendOBD("ATSP0");delay(200); }
@@ -226,10 +275,13 @@ void bleTask(void*){
   const int NG = sizeof(gaugePid)/sizeof(gaugePid[0]);
   int bgIdx=0, slot=0; unsigned long lastReq=0,lastRetry=0; bool awaiting=false;
   while (true){
-    // disconnect watchdog: stack reports closed, OR no OBD response for >4s (covers an
-    // adapter that powered off / went out of range, where onDisconnect can be slow/absent)
-    if (bleConnected && (!pClient || !pClient->isConnected() || millis()-lastRespMs > 2500)){
-      Serial.println("[ble] connection lost");
+    // disconnect watchdog: link reported closed, OR (only AFTER data has started flowing)
+    // no response for >5s. Gating on respCount avoids killing a real ELM327 during its
+    // initial protocol search, which can take several seconds before the first reply.
+    bool linkDown = !pClient || !pClient->isConnected();
+    bool stalled  = (respCount>0) && (millis()-lastRespMs > 5000);
+    if (bleConnected && (linkDown || stalled)){
+      Serial.printf("[ble] connection lost (%s)\n", linkDown?"link":"stalled");
       if (pClient) pClient->disconnect();
       bleConnected=false; awaiting=false;
     }
@@ -240,8 +292,9 @@ void bleTask(void*){
       // send next only after response AND >=MIN_REQ_INTERVAL_MS since last send (<=10 req/s)
       if (!awaiting && now-lastReq>=MIN_REQ_INTERVAL_MS){
         const char* pid;
+        int ag = (currentGauge<NG)?currentGauge:0;                  // settings page -> default RPM
         if (slot%3==2){ pid=gaugePid[bgIdx]; bgIdx=(bgIdx+1)%NG; }   // background sweep
-        else          { pid=gaugePid[currentGauge]; }               // active gauge (priority)
+        else          { pid=gaugePid[ag]; }                         // active gauge (priority)
         gotResponse=false; sendOBD(pid); lastReq=now; awaiting=true;
       }
     }
@@ -451,8 +504,8 @@ void drawGauge(int gi, float value, int fps){
   canvas.drawString(g.unit, CX, CY+34);
 
   // page dots
-  int dotsY=CY+62, sp=14, x0=CX-(NUM_GAUGES-1)*sp/2;
-  for (int i=0;i<NUM_GAUGES;i++){
+  int dotsY=CY+62, sp=14, x0=CX-(SETTINGS_PAGE)*sp/2;   // NUM_GAUGES gauges + settings page
+  for (int i=0;i<=SETTINGS_PAGE;i++){
     if (i==gi) canvas.fillCircle(x0+i*sp, dotsY, 3, hex565(BR_BLUE_300));
     else       canvas.drawCircle(x0+i*sp, dotsY, 2, hex565(BR_SLATE_400));
   }
@@ -534,6 +587,46 @@ void drawZB(){
   canvas.pushSprite(0,0);
 }
 
+// toggle logging + persist to NVS; (re)arm or stop the capture buffer
+void setLogging(bool on){
+  logEnabled = on;
+  prefs.putBool("logEn", on);
+  if (on){ logLen=0; logFlushed=false; logCapturing=true; logStartMs=millis(); }
+  else   { logCapturing=false; }
+  Serial.printf("[log] logging %s (saved)\n", on?"ENABLED":"disabled");
+}
+
+// Settings page (6th swipe): logging on/off + status.
+void drawSettings(){
+  canvas.fillSprite(TFT_BLACK);
+  canvas.setTextDatum(top_center);
+  canvas.setFont(&fonts::Font2); canvas.setTextColor(hex565(BR_SLATE_250));
+  canvas.drawString("SETTINGS", CX, 24);
+
+  // LOG toggle (big, tappable)
+  canvas.setTextDatum(middle_center); canvas.setFont(&fonts::Font4);
+  canvas.setTextColor(logEnabled?hex565(BR_GREEN_500):hex565(BR_SLATE_400));
+  canvas.drawString(logEnabled?"LOG: ON":"LOG: OFF", CX, CY-18);
+
+  canvas.setFont(&fonts::Font2); canvas.setTextColor(hex565(BR_SLATE_300));
+  canvas.drawString("tap to toggle", CX, CY+18);
+
+  // status line: capturing / saved bytes
+  char st[40];
+  if (logCapturing)      snprintf(st, sizeof(st), "capturing %u B", (unsigned)logLen);
+  else if (logEnabled)   snprintf(st, sizeof(st), "saved (reboot=dump)");
+  else                   snprintf(st, sizeof(st), "off");
+  canvas.setTextColor(hex565(BR_GRAY_700)); canvas.drawString(st, CX, CY+44);
+
+  // page dots
+  int dotsY=CY+62, sp=14, x0=CX-(SETTINGS_PAGE)*sp/2;
+  for (int i=0;i<=SETTINGS_PAGE;i++){
+    if (i==SETTINGS_PAGE) canvas.fillCircle(x0+i*sp, dotsY, 3, hex565(BR_BLUE_300));
+    else                  canvas.drawCircle(x0+i*sp, dotsY, 2, hex565(BR_SLATE_400));
+  }
+  canvas.pushSprite(0,0);
+}
+
 void drawBootScreen(const char* msg){
   canvas.fillSprite(TFT_BLACK); canvas.setTextColor(TFT_WHITE); canvas.setTextDatum(middle_center);
   canvas.setFont(&fonts::Font4); canvas.drawString(msg, CX, CY); canvas.pushSprite(0,0);
@@ -575,6 +668,15 @@ void setup(){
   Serial.println("\n[boot] round_obd_gauge  ESP32-C3 (multi-gauge)");
   Serial.printf("[boot] free heap: %u B\n", ESP.getFreeHeap());
 
+  // NVS: load logging flag, dump the previous session's saved log, arm a fresh capture
+  prefs.begin("obdgauge", false);
+  logEnabled = prefs.getBool("logEn", false);
+  { String prev = prefs.getString("log", "");
+    if (prev.length()){ Serial.println("\n===== STORED LOG (previous session) ====="); Serial.println(prev); Serial.println("===== END STORED LOG =====\n"); }
+    else Serial.println("[log] no stored log"); }
+  Serial.printf("[log] logging %s\n", logEnabled?"ENABLED":"disabled");
+  if (logEnabled){ logCapturing=true; logStartMs=millis(); logLen=0; }
+
   pinMode(PIN_BL, OUTPUT); digitalWrite(PIN_BL, HIGH);
 
   initLUT();
@@ -612,9 +714,10 @@ void loop(){
   // --- touch events (one-shot). swipe = switch gauge; double-tap on SPEED = 0-100 mode;
   //     single-tap = peak-hold; long-press = reset peaks. Double-tap is synthesized from
   //     two taps so it doesn't depend on the chip's (unreliable) double-click register.
+  const int NPAGES = SETTINGS_PAGE + 1;   // 5 gauges + settings
   uint8_t ev = touchEvent();
-  if (ev==G_SLIDE_LEFT)  { currentGauge=(currentGauge+1)%NUM_GAUGES; zbActive=false; pendingSingle=false; Serial.printf("[touch] -> %s\n", GAUGES[currentGauge].name); }
-  else if (ev==G_SLIDE_RIGHT){ currentGauge=(currentGauge-1+NUM_GAUGES)%NUM_GAUGES; zbActive=false; pendingSingle=false; Serial.printf("[touch] -> %s\n", GAUGES[currentGauge].name); }
+  if (ev==G_SLIDE_LEFT)  { currentGauge=(currentGauge+1)%NPAGES; zbActive=false; pendingSingle=false; }
+  else if (ev==G_SLIDE_RIGHT){ currentGauge=(currentGauge-1+NPAGES)%NPAGES; zbActive=false; pendingSingle=false; }
   else if (ev==G_LONG)   { for (int i=0;i<NUM_GAUGES;i++) peak[i]=view_val[i]; pendingSingle=false; Serial.println("[touch] peak reset"); }
   else if (ev==G_TAP){
     if (nowT - lastTapMs < DTAP_MS){          // ---- DOUBLE TAP ----
@@ -630,7 +733,8 @@ void loop(){
   // resolve a lone single-tap once the double-tap window passes
   if (pendingSingle && nowT - pendingTapMs >= DTAP_MS){
     pendingSingle=false;
-    if (zbActive) zbState=(disp_val[1]<ZB_ARM?ZB_ARMED:ZB_WAIT);   // re-arm
+    if (currentGauge==SETTINGS_PAGE) setLogging(!logEnabled);       // settings: toggle logging
+    else if (zbActive) zbState=(disp_val[1]<ZB_ARM?ZB_ARMED:ZB_WAIT); // re-arm
     else { peakHold=!peakHold; Serial.printf("[touch] peakHold=%d\n", peakHold); }
   }
 
@@ -721,14 +825,22 @@ void loop(){
       }
     }
 
+    // persist the first-minute diagnostic log to NVS (read it on next boot, no laptop needed)
+    if (logCapturing && !logFlushed && millis()-logStartMs >= LOG_WINDOW_MS){
+      logBuf[logLen]=0; prefs.putString("log", logBuf);
+      logCapturing=false; logFlushed=true;
+      Serial.printf("[log] saved %u bytes to NVS\n", (unsigned)logLen);
+    }
+
     frames++;
     if (now-lastFps>=1000){ fps=frames; frames=0; lastFps=now;
-      Serial.printf("[run] %s=%.1f fps=%d ble=%s%s\n",
-                    GAUGES[currentGauge].name, view_val[currentGauge], fps,
-                    bleConnected?"1":"0", demoMode?" DEMO":""); }
+      Serial.printf("[run] gi=%d ble=%s%s rpm=%.0f SPD=%.1f cool=%.0f boost=%.2f tim=%.0f fps=%d\n",
+                    currentGauge, bleConnected?"1":"0", demoMode?" DEMO":"",
+                    view_val[0], view_val[1], view_val[2], view_val[3], view_val[4], fps); }
 
-    if (zbActive) drawZB();
-    else          drawGauge(currentGauge, view_val[currentGauge], fps);
+    if (currentGauge==SETTINGS_PAGE) drawSettings();
+    else if (zbActive)               drawZB();
+    else                             drawGauge(currentGauge, view_val[currentGauge], fps);
   }
   vTaskDelay(1);
 }
